@@ -2,46 +2,84 @@ require 'stringex'
 
 module Mongoid #:nodoc:
 
-  # Generates a URL slug or permalink based on one or more fields in a Mongoid
-  # model.
+  # The slug module helps you generate a URL slug or permalink based on one or
+  # more fields in a Mongoid model.
+  #
+  #    class Person
+  #      include Mongoid::Document
+  #      include Mongoid::Slug
+  #
+  #      field :name
+  #      slug :name
+  #    end
+  #
   module Slug
     extend ActiveSupport::Concern
+    
+    RESERVED_NAMES = %w(new edit)
 
     included do
-      cattr_accessor :slug_name, :slugged_fields, :slug_scope, :first_valid
+      cattr_accessor :slug_builder, :slugged_fields, :slug_name, :slug_scope
     end
 
     module ClassMethods
 
       # Sets one ore more fields as source of slug.
       #
-      # By default, the name of the field that stores the slug is "slug". Pass an
-      # alternative name with the :as option.
+      # Takes a list of fields to slug and an optional options hash.
       #
-      # If you wish the slug to be permanent once created, set :permanent to true.
+      # The options hash respects the following members:
       #
-      # To index slug in a top-level object, set :index to true.
-      def slug(*fields)
+      # * `:as`, which specifies name of the field that stores the slug.
+      # Defaults to `slug`.
+      #
+      # * `:scope`, which specifies a reference association to scope the slug
+      # by. Embedded documents are by default scoped by their parent.
+      #
+      # * `:permanent`, which specifies whether the slug should be immutable
+      # once created. Defaults to `false`.
+      #
+      # * `:index`, which specifies whether an index should be defined for the
+      # slug. Defaults to `false` and has no effect if the document is em-
+      # bedded.
+      #
+      # Alternatively, this method can be given a block to build a custom slug
+      # out of the specified fields.
+      #
+      # The block takes a single argument, the document itself, and should
+      # return a string that will serve as the base of the slug.
+      #
+      # Here, for instance, we slug an array field.
+      #
+      #     class Person
+      #      include Mongoid::Document
+      #      include Mongoid::Slug
+      #
+      #      field :names, :type => Array
+      #      slug :names do |doc|
+      #        doc.names.join(' ')
+      #      end
+      #
+      def slug(*fields, &block)
         options = fields.extract_options!
 
-        self.slug_name      = options[:as] || :slug
-        self.slug_scope     = options[:scope] || nil
-        self.first_valid    = options[:any] || false
-        self.slugged_fields = fields
+        self.slug_scope = options[:scope]
+        self.slug_name = options[:as] || :slug
+        self.slugged_fields = fields.map(&:to_s)
 
-        if options[:scoped]
-          ActiveSupport::Deprecation.warn <<-EOM
-
-            The :scoped => true option is deprecated and now default for embedded
-            child documents. Please use :scope => :association_name if you wish
-            to scope by a reference association.
-          EOM
-        end
+        self.slug_builder =
+          if block_given?
+            block
+          else
+            lambda do |doc|
+              slugged_fields.map { |f| doc.read_attribute(f) }.join(',')
+            end
+          end
 
         field slug_name
 
         if options[:index]
-          index slug_name, :unique => !slug_scope
+          index(slug_name, :unique => !slug_scope)
         end
 
         if options[:permanent]
@@ -50,67 +88,73 @@ module Mongoid #:nodoc:
           before_save :generate_slug
         end
 
+        # Build a finder based on the slug name.
+        #
+        # Defaults to `find_by_slug`.
         instance_eval <<-CODE
           def self.find_by_#{slug_name}(slug)
-            where(slug_name => slug).first rescue nil
+            where(slug_name => slug).first
+          end
+
+          def self.find_by_#{slug_name}!(slug)
+            where(slug_name => slug).first || raise(Mongoid::Errors::DocumentNotFound.new(self.class, slug))
           end
         CODE
       end
     end
 
+    # Regenerates slug.
+    #
+    # Should come in handy when generating slugs for an existing collection.
+    def slug!
+      generate_slug!
+      save
+    end
+
+    # Returns the slug.
     def to_param
-      self.send(slug_name)
+      read_attribute(slug_name)
     end
 
     private
 
-    attr_reader :slug_counter
-
-    def build_slug
-      ("#{slug_base} #{slug_counter}").to_url
-    end
-
     def find_unique_slug
-      slug = build_slug
-      if unique_slug?(slug)
-        slug
-      else
-        increment_slug_counter
-        find_unique_slug
+      slug = slug_builder.call(self).to_url
+      slug += "-1" if RESERVED_NAMES.include?(slug)
+            
+      # Regular expression that matches slug, slug-1, slug-2, ... slug-n
+      # If slug_name field was indexed, MongoDB will utilize that index to
+      # match /^.../ pattern
+      pattern = /^#{Regexp.escape(slug)}(?:-(\d+))?$/
+      
+      existing_slugs = uniqueness_scope.only(slug_name).where(slug_name => pattern, :_id.ne => _id).map{|obj| obj.try(:read_attribute, slug_name)}    
+      
+      if existing_slugs.count > 0      
+        # sort the existing_slugs in increasing order by comparing the suffix numbers:
+        # slug, slug-1, slug-2, ..., slug-n
+        existing_slugs = existing_slugs.sort{|a, b| (pattern.match(a)[1] || -1).to_i <=> (pattern.match(b)[1] || -1).to_i}
+        max_counter = existing_slugs.last.match(/-(\d+)$/).try(:[], 1).to_i
+
+        # Use max_counter + 1 as unique counter
+        slug += "-#{max_counter + 1}"
       end
+      
+      slug
     end
 
     def generate_slug
       if new_record? || slugged_fields_changed?
-        self.send("#{slug_name}=", find_unique_slug)
+        generate_slug!
       end
     end
 
-    def increment_slug_counter
-      @slug_counter = (slug_counter.to_i + 1).to_s
-    end
 
-    def slug_base
-      slug_field_values = self.class.slugged_fields.map do |field|
-        self.send(field)
-      end
-      if first_valid
-        slug_field_values.detect {|v| v.present? }
-      else
-        slug_field_values.join(" ")
-      end
+    def generate_slug!
+      write_attribute(slug_name, find_unique_slug)
     end
 
     def slugged_fields_changed?
-      self.class.slugged_fields.any? do |field|
-        self.send("#{field}_changed?")
-      end
-    end
-
-    def unique_slug?(slug)
-      uniqueness_scope.where(slug_name => slug).
-        reject { |doc| doc.id == self.id }.
-        empty?
+      slugged_fields.any? { |f| attribute_changed?(f) }
     end
 
     def uniqueness_scope
@@ -127,8 +171,8 @@ module Mongoid #:nodoc:
         inverse = metadata.inverse_of || collection_name
         parent.respond_to?(inverse) ? parent.send(inverse) : self.class
       elsif embedded?
-        metadata = reflect_on_all_associations(:embedded_in).first
-        _parent.send(metadata.inverse_of)
+        parent_metadata = reflect_on_all_associations(:embedded_in).first
+        _parent.send(parent_metadata.inverse_of || self.metadata.name)
       else
         appropriate_class = self.class
         while (appropriate_class.superclass.include?(Mongoid::Document))

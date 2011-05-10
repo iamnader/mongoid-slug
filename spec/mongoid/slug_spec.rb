@@ -19,8 +19,10 @@ module Mongoid
       end
 
       it "generates a unique slug by appending a counter to duplicate text" do
-        dup = Book.create(:title => book.title)
-        dup.to_param.should eql "a-thousand-plateaus-1"
+        15.times{ |x|
+          dup = Book.create(:title => book.title)
+          dup.to_param.should eql "a-thousand-plateaus-#{x+1}"
+        }
       end
 
       it "does not update slug if slugged fields have not changed" do
@@ -36,6 +38,12 @@ module Mongoid
 
       it "finds by slug" do
         Book.find_by_slug(book.to_param).should eql book
+      end
+    end
+
+    context "when using default_scope on a model" do
+      it "find_unique_slug should work correctly" do
+        Page.create!(:title => "Title", :content => "Content", :order => 1)
       end
     end
 
@@ -146,6 +154,13 @@ module Mongoid
           :first_name => author.first_name,
           :last_name  => author.last_name)
         dup.to_param.should eql 'gilles-deleuze-1'
+
+        dup2 = Author.create(
+          :first_name => author.first_name,
+          :last_name  => author.last_name)
+
+        dup.save
+        dup2.to_param.should eql 'gilles-deleuze-2'
       end
 
       it "does not update slug if slugged fields have changed but generated slug is identical" do
@@ -156,26 +171,6 @@ module Mongoid
 
       it "finds by slug" do
         Author.find_by_slug("gilles-deleuze").should eql author
-      end
-
-    end
-    
-    context "when :any is passed as an argument" do
-      let!(:article) do
-        Article.create(
-          :brief => "This is the brief",
-          :title => "This is the title")
-      end
-      
-      it "uses the first available field for the slug if any option is used" do
-        article.to_param.should eql 'this-is-the-title'
-        article.title = ""
-        article.save
-        article.to_param.should eql 'this-is-the-brief'
-        
-        article.title = nil
-        article.save
-        article.to_param.should eql 'this-is-the-brief'
       end
     end
 
@@ -247,6 +242,34 @@ module Mongoid
       end
     end
 
+    context "when :slug is given a block" do
+      let(:caption) do
+        Caption.create(:identity => 'Edward Hopper (American, 1882-1967)',
+                       :title    => 'Soir Bleu, 1914',
+                       :medium   => 'Oil on Canvas')
+      end
+
+      it "generates a slug" do
+        caption.to_param.should eql 'edward-hopper-soir-bleu-1914'
+      end
+
+      it "updates the slug" do
+        caption.title = 'Road in Maine, 1914'
+        caption.save
+        caption.to_param.should eql "edward-hopper-road-in-maine-1914"
+      end
+
+      it "does not change slug if slugged fields have changed but generated slug is identical" do
+        caption.identity = 'Edward Hopper'
+        caption.save
+        caption.to_param.should eql 'edward-hopper-soir-bleu-1914'
+      end
+
+      it "finds by slug" do
+        Caption.find_by_slug(caption.to_param).should eql caption
+      end
+    end
+
     it "works with non-Latin characters" do
       book.title = "Капитал"
       book.save
@@ -259,16 +282,10 @@ module Mongoid
       book.title = "中文"
       book.save
       book.to_param.should eql 'zhong-wen'
-    end
 
-    it "deprecates the :scoped option" do
-      ActiveSupport::Deprecation.should_receive(:warn)
-      class Oldie
-        include Mongoid::Document
-        include Mongoid::Slug
-        field :name
-        slug  :name, :scoped => true
-      end
+      book.title = 'Paul Cézanne'
+      book.save
+      book.to_param.should eql 'paul-cezanne'
     end
 
     context "when :index is passed as an argument" do
@@ -295,8 +312,6 @@ module Mongoid
           Book.index_information["slug_1"]["unique"].should be_true
         end
       end
-
-      it "has no effect in embedded objects"
     end
 
     context "when :index is not passed as an argument" do
@@ -311,6 +326,58 @@ module Mongoid
         book = Book.create(:title => "Anti Oedipus")
         comic_book = ComicBook.create(:title => "Anti Oedipus")
         comic_book.slug.should_not eql(book.title)
+      end
+    end
+
+    describe "#slug!" do
+      before do
+        class Foo
+          include Mongoid::Document
+          field :name
+        end
+      end
+
+      let!(:foo) do
+        Foo.create(:name => "John")
+      end
+
+      it "regenerates slug" do
+        class Foo
+          include Mongoid::Slug
+          slug :name
+        end
+
+        foo.reload.slug.should be_nil
+
+        foo.slug!
+
+        foo.reload.slug.should eql 'john'
+      end
+    end
+
+    describe ".find_by_slug" do
+      let!(:book) { Book.create(:title => "A Thousand Plateaus") }
+
+      it "returns nil if no document is found" do
+        Book.find_by_slug(:title => "Anti Oedipus").should be_nil
+      end
+
+      it "returns the document if it is found" do
+        Book.find_by_slug(book.slug).should == book
+      end
+    end
+
+    describe ".find_by_slug!" do
+      let!(:book) { Book.create(:title => "A Thousand Plateaus") }
+
+      it "raises a Mongoid::Errors::DocumentNotFound error if no document is found" do
+        lambda {
+          Book.find_by_slug!(:title => "Anti Oedipus")
+        }.should raise_error(Mongoid::Errors::DocumentNotFound)
+      end
+
+      it "returns the document when it is found" do
+        Book.find_by_slug!(book.slug).should == book
       end
     end
   end
